@@ -30,7 +30,7 @@ impl From<EpeeError> for InterfaceError {
 fn read_u64_array_from_epee(len: usize, mut epee: &[u8]) -> Result<Vec<u64>, InterfaceError> {
   // This is safe to pre-allocate due to the byte buffer being prior-checked to have this many items
   let mut res = Vec::with_capacity(len);
-  for _ in 0 .. len {
+  for _ in 0..len {
     res.push(read_u64(&mut epee).map_err(|_| {
       InterfaceError::InternalError(
         "incomplete array despite precondition the array is complete".to_string(),
@@ -273,7 +273,7 @@ pub(super) fn extract_blocks_from_blocks_bin(
                   };
 
                   // Only use the prunable hash if this transaction has a well-defined prunable hash
-                  let prunable_hash =
+                  let mut prunable_hash =
                     prunable_hash.filter(|_| !matches!(transaction, Transaction::V1 { .. }));
 
                   /*
@@ -284,10 +284,18 @@ pub(super) fn extract_blocks_from_blocks_bin(
 
                     https://github.com/monero-project/monero/issues/10120
                   */
-                  if matches!(transaction, Transaction::V2 { proofs: Some(_), .. }) &&
-                    (prunable_hash.is_none() || (prunable_hash == Some([0; 32])))
+                  if matches!(transaction, Transaction::V2 { proofs: Some(_), .. })
+                    && (prunable_hash.is_none() || (prunable_hash == Some([0; 32])))
                   {
-                    return Ok(None);
+                    #[cfg(not(feature = "walletcore-lenient-prunable"))]
+                    {
+                      return Ok(None);
+                    }
+                    #[cfg(feature = "walletcore-lenient-prunable")]
+                    {
+                      // Lenient mode: accept missing/zero prunable hash by normalizing to zero hash.
+                      prunable_hash = Some([0; 32]);
+                    }
                   }
 
                   let transaction =
@@ -362,7 +370,7 @@ pub(super) fn extract_blocks_from_blocks_bin(
       *output_index_for_first_ringct_output =
         output_index_for_first_ringct_output.or(Some(all_output_indexes[0]));
     }
-    all_output_indexes = &all_output_indexes[outputs ..];
+    all_output_indexes = &all_output_indexes[outputs..];
     Ok(())
   };
   let mut result = Vec::with_capacity(res.len());

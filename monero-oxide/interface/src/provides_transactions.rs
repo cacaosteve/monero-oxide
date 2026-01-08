@@ -28,7 +28,15 @@ impl PrunedTransactionWithPrunableHash {
       }
       Transaction::V2 { proofs, .. } => {
         if prunable_hash.is_none() {
-          None?;
+          #[cfg(not(feature = "walletcore-lenient-prunable"))]
+          {
+            None?;
+          }
+          #[cfg(feature = "walletcore-lenient-prunable")]
+          {
+            // Lenient mode: accept missing prunable hash by normalizing to zero hash.
+            prunable_hash = Some([0; 32]);
+          }
         }
         if proofs.is_none() {
           prunable_hash = Some([0; 32]);
