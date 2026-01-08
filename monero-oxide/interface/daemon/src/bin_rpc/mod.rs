@@ -1,6 +1,7 @@
 use core::{
   ops::{Bound, RangeBounds},
   future::Future,
+  time::Duration,
 };
 
 use alloc::{format, vec, vec::Vec, string::ToString};
@@ -33,6 +34,24 @@ macro_rules! epee_key_len {
 
 mod blocks_bin;
 
+fn duration_ms(d: Duration) -> u128 {
+  d.as_millis()
+}
+
+fn telemetry_enabled() -> bool {
+  cfg!(feature = "walletcore-telemetry")
+}
+
+/// Telemetry helper intended for performance diagnosis. This uses stderr to be visible in most
+/// environments (including iOS simulator logs) without requiring a logging framework.
+macro_rules! telemetry {
+  ($($t:tt)*) => {{
+    if telemetry_enabled() {
+      eprintln!($($t)*);
+    }
+  }};
+}
+
 impl<T: HttpTransport> MoneroDaemon<T> {
   /// Perform a binary call to the specified route with the provided parameters.
   ///
@@ -55,10 +74,21 @@ impl<T: HttpTransport> MoneroDaemon<T> {
       full_response_size_limit.min(MAX_RESPONSE_SIZE)
     };
 
-    let mut res = self
-      .transport
-      .post(route, params, self.response_size_limits.then_some(response_size_limit))
-      .await?;
+    let req_bytes = params.len();
+    let limit_bytes = self.response_size_limits.then_some(response_size_limit);
+    let t0 = std::time::Instant::now();
+
+    telemetry!(
+      "🛰️  daemon_bin_call start route={} req_bytes={} response_limit_bytes={}",
+      route,
+      req_bytes,
+      limit_bytes.unwrap_or(0)
+    );
+
+    let mut res = self.transport.post(route, params, limit_bytes).await?;
+
+    let http_ms = duration_ms(t0.elapsed());
+    let raw_bytes = res.len();
 
     /*
       If the transport erroneously returned more bytes, truncate it before we expand it into an
@@ -67,8 +97,21 @@ impl<T: HttpTransport> MoneroDaemon<T> {
       the cut-off without issue, so long as we stop our deserialization before hitting EOF.
     */
     res.truncate(response_size_limit);
+    let trunc_bytes = res.len();
 
+    let t1 = std::time::Instant::now();
     epee::check_status(&res)?;
+    let status_ms = duration_ms(t1.elapsed());
+
+    telemetry!(
+      "🛰️  daemon_bin_call ok route={} http_ms={} status_ms={} resp_bytes_raw={} resp_bytes_trunc={}",
+      route,
+      http_ms,
+      status_ms,
+      raw_bytes,
+      trunc_bytes
+    );
+
     Ok(res)
   }
 }
@@ -340,8 +383,8 @@ impl<T: HttpTransport> ProvidesUnvalidatedDecoys for MoneroDaemon<T> {
                 //   /cc73fe71162d564ffda8e549b79a350bca53c454/src/cryptonote_core
                 //   /blockchain.cpp#L3836
                 let transaction_timelock_satisfied =
-                  Timelock::Block(block_number.saturating_add(ACCEPTED_TIMELOCK_DELTA)) >=
-                    txs[i].prefix().additional_timelock;
+                  Timelock::Block(block_number.saturating_add(ACCEPTED_TIMELOCK_DELTA))
+                    >= txs[i].prefix().additional_timelock;
 
                 global_timelock_satisfied && transaction_timelock_satisfied
               }

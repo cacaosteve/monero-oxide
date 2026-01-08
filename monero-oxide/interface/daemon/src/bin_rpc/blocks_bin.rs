@@ -12,6 +12,18 @@ use crate::{MAX_RESPONSE_SIZE, HttpTransport, MoneroDaemon};
 
 use super::epee;
 
+fn walletcore_telemetry_enabled() -> bool {
+  cfg!(feature = "walletcore-telemetry")
+}
+
+macro_rules! walletcore_telemetry {
+  ($($t:tt)*) => {{
+    if walletcore_telemetry_enabled() {
+      eprintln!($($t)*);
+    }
+  }};
+}
+
 impl<T: HttpTransport> MoneroDaemon<T> {
   /// This MUST NOT be called with a start of `0`.
   ///
@@ -21,6 +33,13 @@ impl<T: HttpTransport> MoneroDaemon<T> {
     range: RangeInclusive<usize>,
     res: &mut Vec<UnvalidatedScannableBlock>,
   ) -> Result<bool, InterfaceError> {
+    let t_fetch_total = std::time::Instant::now();
+    walletcore_telemetry!(
+      "🧱 fetch_contiguous_blocks start start={} end={} (bin:get_blocks.bin)",
+      *range.start(),
+      *range.end()
+    );
+
     /*
       The following code uses `get_blocks.bin`, with the request specifying the `start_height`
       field. Monero only observes this field if it has a non-zero value, hence why we must bound
@@ -37,6 +56,7 @@ impl<T: HttpTransport> MoneroDaemon<T> {
     }
 
     let Some(requested_blocks_sub_one) = range.end().checked_sub(*range.start()) else {
+      walletcore_telemetry!("🧱 fetch_contiguous_blocks early_exit empty_range");
       return Ok(true);
     };
     let Some(requested_blocks) = requested_blocks_sub_one.checked_add(1) else {
@@ -74,7 +94,12 @@ impl<T: HttpTransport> MoneroDaemon<T> {
     request.push(epee::Type::Uint64 as u8);
     debug_assert_eq!(expected_request_header_len, request.len());
 
+    let mut total_blocks_received: u64 = 0;
+    let mut calls: u64 = 0;
+
     while start <= end {
+      calls += 1;
+
       request.truncate(expected_request_header_len);
 
       request.extend(start.to_le_bytes());
@@ -92,11 +117,21 @@ impl<T: HttpTransport> MoneroDaemon<T> {
 
       debug_assert_eq!(expected_request_len, request.len());
 
+      let t_call = std::time::Instant::now();
       let epee = self.bin_call("get_blocks.bin", request.clone(), MAX_RESPONSE_SIZE).await?;
+      let call_ms = t_call.elapsed().as_millis();
 
+      let t_decode = std::time::Instant::now();
       let blocks_received = {
         let mut blocks_received = 0;
         let Some(blocks) = epee::extract_blocks_from_blocks_bin(&epee)? else {
+          walletcore_telemetry!(
+            "🧱 fetch_contiguous_blocks bin_not_applicable start_height={} end_height={} call_ms={} epee_bytes={}",
+            start,
+            end,
+            call_ms,
+            epee.len()
+          );
           return Ok(false);
         };
         for block in blocks {
@@ -114,6 +149,22 @@ impl<T: HttpTransport> MoneroDaemon<T> {
         }
         blocks_received
       };
+      let decode_ms = t_decode.elapsed().as_millis();
+
+      total_blocks_received = total_blocks_received.saturating_add(blocks_received as u64);
+
+      walletcore_telemetry!(
+        "🧱 fetch_contiguous_blocks batch_ok call={} start_height={} end_height={} asked_remaining={} got_blocks={} call_ms={} decode_ms={} epee_bytes={}",
+        calls,
+        start,
+        end,
+        remaining_blocks.saturating_add(blocks_received as u64),
+        blocks_received,
+        call_ms,
+        decode_ms,
+        epee.len()
+      );
+
       if blocks_received == 0 {
         Err(InterfaceError::InvalidInterface(
           "received zero blocks when requesting multiple".to_string(),
@@ -122,6 +173,15 @@ impl<T: HttpTransport> MoneroDaemon<T> {
 
       start = (end - remaining_blocks) + 1;
     }
+
+    walletcore_telemetry!(
+      "🧱 fetch_contiguous_blocks ok start={} end={} calls={} blocks={} total_ms={}",
+      *range.start(),
+      *range.end(),
+      calls,
+      total_blocks_received,
+      t_fetch_total.elapsed().as_millis()
+    );
 
     Ok(true)
   }
@@ -197,8 +257,8 @@ async fn expand<T: HttpTransport>(
           "daemon sent us a block it doesn't have the transactions for".to_string(),
         ),
         TransactionsError::PrunedTransaction => InterfaceError::InternalError(
-          "complaining about receiving a pruned transaction when".to_string() +
-            " requesting a pruned transaction",
+          "complaining about receiving a pruned transaction when".to_string()
+            + " requesting a pruned transaction",
         ),
       })?;
   let mut next_ringct_output_index = None;
@@ -230,16 +290,28 @@ impl<T: HttpTransport> ProvidesUnvalidatedScannableBlocks for MoneroDaemon<T> {
     mut range: RangeInclusive<usize>,
   ) -> impl Send + Future<Output = Result<Vec<UnvalidatedScannableBlock>, InterfaceError>> {
     async move {
+      let t_total = std::time::Instant::now();
+      walletcore_telemetry!(
+        "🧭 contiguous_scannable_blocks start start={} end={}",
+        *range.start(),
+        *range.end()
+      );
+
       let mut res = vec![];
       // Handle the exceptional case where we're also requesting the genesis block, which
       // `fetch_contiguous_blocks` cannot handle
       if *range.start() == 0 {
+        walletcore_telemetry!("🧭 contiguous_scannable_blocks includes_genesis true");
         res.push(ProvidesUnvalidatedScannableBlocks::scannable_block_by_number(self, 0).await?);
-        range = 1 ..= *range.end();
+        range = 1..=*range.end();
       }
       let len_before_fetch = res.len();
 
-      if !self.fetch_contiguous_blocks(range.clone(), &mut res).await? {
+      let t_bin = std::time::Instant::now();
+      let bin_ok = self.fetch_contiguous_blocks(range.clone(), &mut res).await?;
+      let bin_ms = t_bin.elapsed().as_millis();
+
+      if !bin_ok {
         // Update the range according to any blocks successfully fetched with this methodology
         let len_successfully_fetched =
           res.len().checked_sub(len_before_fetch).ok_or_else(|| {
@@ -249,15 +321,51 @@ impl<T: HttpTransport> ProvidesUnvalidatedScannableBlocks for MoneroDaemon<T> {
           })?;
         let Some(new_start) = (*range.start()).checked_add(len_successfully_fetched) else {
           // If the new start is unrepresentable, it exceeds the representable end
+          walletcore_telemetry!(
+            "🧭 contiguous_scannable_blocks end_overflow returning_partial blocks={} total_ms={}",
+            res.len(),
+            t_total.elapsed().as_millis()
+          );
           return Ok(res);
         };
-        range = new_start ..= *range.end();
+        range = new_start..=*range.end();
+
+        walletcore_telemetry!(
+          "🧭 contiguous_scannable_blocks bin_unavailable falling_back=json range_start={} range_end={} bin_ms={} already_have={}",
+          *range.start(),
+          *range.end(),
+          bin_ms,
+          len_successfully_fetched
+        );
 
         // Fall back to what's presumably JSON methods
+        let t_json = std::time::Instant::now();
+        let mut json_blocks: u64 = 0;
         for block in ProvidesUnvalidatedBlockchain::contiguous_blocks(self, range).await? {
           res.push(expand(self, block).await?);
+          json_blocks += 1;
         }
+        let json_ms = t_json.elapsed().as_millis();
+
+        walletcore_telemetry!(
+          "🧭 contiguous_scannable_blocks json_ok blocks_added={} json_ms={}",
+          json_blocks,
+          json_ms
+        );
+      } else {
+        walletcore_telemetry!(
+          "🧭 contiguous_scannable_blocks bin_ok blocks={} bin_ms={}",
+          res.len().saturating_sub(len_before_fetch),
+          bin_ms
+        );
       }
+
+      walletcore_telemetry!(
+        "🧭 contiguous_scannable_blocks ok total_blocks={} total_ms={}",
+        res.len(),
+        t_total.elapsed().as_millis()
+      );
+
       Ok(res)
     }
   }

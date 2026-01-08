@@ -40,4 +40,9 @@ std = [
   "monero-address/std",
   "monero-interface/std",
 ]
+
+# Optional performance logging used by MoneroWalletCoreFFI during iOS optimization.
+# When enabled, internal daemon RPC calls will emit telemetry to stderr.
+walletcore-telemetry = []
+
 default = ["std"]
