@@ -42,6 +42,34 @@ fn telemetry_enabled() -> bool {
   cfg!(feature = "walletcore-telemetry")
 }
 
+fn telemetry_req_hex_enabled() -> bool {
+  if !telemetry_enabled() {
+    return false;
+  }
+  match std::env::var("WALLETCORE_TELEMETRY_REQ_HEX") {
+    Ok(v) => {
+      let v = v.trim();
+      v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+    }
+    Err(_) => false,
+  }
+}
+
+fn hex_prefix(bytes: &[u8], max_len: usize) -> String {
+  let mut s = String::new();
+  let end = bytes.len().min(max_len);
+  for (i, b) in bytes[..end].iter().enumerate() {
+    if i != 0 {
+      s.push(' ');
+    }
+    s.push_str(&format!("{:02x}", b));
+  }
+  if bytes.len() > end {
+    s.push_str(" …");
+  }
+  s
+}
+
 /// Telemetry helper intended for performance diagnosis. This uses stderr to be visible in most
 /// environments (including iOS simulator logs) without requiring a logging framework.
 macro_rules! telemetry {
@@ -84,6 +112,15 @@ impl<T: HttpTransport> MoneroDaemon<T> {
       req_bytes,
       limit_bytes.unwrap_or(0)
     );
+
+    if telemetry_req_hex_enabled() {
+      telemetry!(
+        "🛰️  daemon_bin_call req_hex_prefix route={} prefix_len={} hex={}",
+        route,
+        req_bytes.min(96),
+        hex_prefix(&params, 96)
+      );
+    }
 
     let mut res = self.transport.post(route, params, limit_bytes).await?;
 
