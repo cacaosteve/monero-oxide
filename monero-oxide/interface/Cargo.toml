@@ -37,4 +37,5 @@ std = [
   "monero-oxide/std",
 ]
 walletcore-lenient-prunable = []
+walletcore-lenient-tx-verify = []
 default = ["std"]

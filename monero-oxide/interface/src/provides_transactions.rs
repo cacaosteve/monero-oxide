@@ -5,6 +5,13 @@ use monero_oxide::transaction::{Pruned, Transaction};
 
 use crate::InterfaceError;
 
+/// When enabled, transaction hash mismatches will not hard-fail validation.
+/// This is intended strictly for BIN-path debugging/perf work where we want to keep
+/// exercising the binary pipeline even if some daemons return unverifiable pruned txs.
+fn walletcore_lenient_tx_verify_enabled() -> bool {
+  cfg!(feature = "walletcore-lenient-tx-verify")
+}
+
 /// A pruned transaction with the hash of its pruned data, if `version != 1`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PrunedTransactionWithPrunableHash {
@@ -224,9 +231,12 @@ pub(crate) async fn validate_pruned_transactions<P: ProvidesTransactions>(
     )))?;
   }
 
+  let lenient = walletcore_lenient_tx_verify_enabled();
+
   let mut txs = Vec::with_capacity(unvalidated.len());
   let mut v1_indexes = vec![];
   let mut v1_hashes = vec![];
+
   for (tx, expected_hash) in unvalidated.into_iter().zip(hashes) {
     match tx.verify_as_possible(*expected_hash) {
       Ok(tx) => {
@@ -236,11 +246,20 @@ pub(crate) async fn validate_pruned_transactions<P: ProvidesTransactions>(
         }
         txs.push(tx)
       }
-      Err(hash) => Err(InterfaceError::InvalidInterface(format!(
-        "interface returned TX {} when {} was requested",
-        hex::encode(hash),
-        hex::encode(expected_hash)
-      )))?,
+      Err(actual_hash) => {
+        if !lenient {
+          Err(InterfaceError::InvalidInterface(format!(
+            "interface returned TX {} when {} was requested",
+            hex::encode(actual_hash),
+            hex::encode(expected_hash)
+          )))?;
+        }
+
+        // Lenient mode: accept the transaction without verification so we can keep
+        // exercising the BIN path. We still parse the tx, but we do not treat the
+        // mismatch as fatal.
+        txs.push(tx.transaction);
+      }
     }
   }
 
@@ -250,10 +269,12 @@ pub(crate) async fn validate_pruned_transactions<P: ProvidesTransactions>(
       v1_indexes.into_iter().map(|i| &txs[i]).zip(v1_hashes).zip(full_txs)
     {
       if &Transaction::<Pruned>::from(tx) != pruned_tx {
-        Err(InterfaceError::InvalidInterface(format!(
-          "interface returned pruned V1 TX which didn't match TX {}",
-          hex::encode(hash)
-        )))?;
+        if !lenient {
+          Err(InterfaceError::InvalidInterface(format!(
+            "interface returned pruned V1 TX which didn't match TX {}",
+            hex::encode(hash)
+          )))?;
+        }
       }
     }
   }
