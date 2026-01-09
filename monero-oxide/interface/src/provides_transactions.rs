@@ -238,27 +238,36 @@ pub(crate) async fn validate_pruned_transactions<P: ProvidesTransactions>(
   let mut v1_hashes = vec![];
 
   for (tx, expected_hash) in unvalidated.into_iter().zip(hashes) {
-    match tx.verify_as_possible(*expected_hash) {
-      Ok(tx) => {
-        if matches!(tx, Transaction::V1 { .. }) {
-          v1_indexes.push(txs.len());
-          v1_hashes.push(*expected_hash);
+    if lenient {
+      // Lenient mode: verify using a clone so we can still keep the original `tx` around
+      // to extract the parsed transaction even when verification fails.
+      match tx.clone().verify_as_possible(*expected_hash) {
+        Ok(tx) => {
+          if matches!(tx, Transaction::V1 { .. }) {
+            v1_indexes.push(txs.len());
+            v1_hashes.push(*expected_hash);
+          }
+          txs.push(tx)
         }
-        txs.push(tx)
+        Err(_actual_hash) => {
+          // Keep exercising the BIN path despite mismatch.
+          txs.push(tx.transaction);
+        }
       }
-      Err(actual_hash) => {
-        if !lenient {
-          Err(InterfaceError::InvalidInterface(format!(
-            "interface returned TX {} when {} was requested",
-            hex::encode(actual_hash),
-            hex::encode(expected_hash)
-          )))?;
+    } else {
+      match tx.verify_as_possible(*expected_hash) {
+        Ok(tx) => {
+          if matches!(tx, Transaction::V1 { .. }) {
+            v1_indexes.push(txs.len());
+            v1_hashes.push(*expected_hash);
+          }
+          txs.push(tx)
         }
-
-        // Lenient mode: accept the transaction without verification so we can keep
-        // exercising the BIN path. We still parse the tx, but we do not treat the
-        // mismatch as fatal.
-        txs.push(tx.transaction);
+        Err(actual_hash) => Err(InterfaceError::InvalidInterface(format!(
+          "interface returned TX {} when {} was requested",
+          hex::encode(actual_hash),
+          hex::encode(expected_hash)
+        )))?,
       }
     }
   }
