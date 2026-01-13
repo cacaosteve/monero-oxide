@@ -961,6 +961,7 @@ dependencies = [
  "monero-interface",
  "monero-oxide",
  "monero-simple-request-rpc",
+ "once_cell",
  "rand",
  "rand_chacha",
  "rand_core",

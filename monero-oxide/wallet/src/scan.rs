@@ -1,5 +1,5 @@
 use core::ops::Deref;
-use std_shims::{vec, vec::Vec, collections::HashMap};
+use std_shims::{collections::HashMap, vec, vec::Vec};
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -9,14 +9,167 @@ use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT as ED25519_BASEPOINT_TABLE;
 
 use monero_oxide::{
-  ed25519::{Scalar, CompressedPoint, Point, Commitment},
-  transaction::{Timelock, Pruned, Transaction},
+  ed25519::{Commitment, CompressedPoint, Point, Scalar},
+  transaction::{Pruned, Timelock, Transaction},
 };
 use monero_interface::ScannableBlock;
 use crate::{
-  address::SubaddressIndex, ViewPair, GuaranteedViewPair, output::*, PaymentId, Extra,
-  SharedKeyDerivations,
+  address::SubaddressIndex, output::*, Extra, GuaranteedViewPair, PaymentId, SharedKeyDerivations,
+  ViewPair,
 };
+
+#[cfg(feature = "scanner-microprof")]
+/// Snapshot of scanner micro-profiler counters/timers.
+///
+/// This is intended for performance diagnostics of wallet scanning. All values are best-effort and
+/// are aggregated across the process.
+///
+/// Units:
+/// - counters are raw event counts
+/// - `ns_*` fields are elapsed nanoseconds accumulated across calls
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScannerMicroprofSnapshot {
+  /// Number of `ScannableBlock`s scanned.
+  pub blocks: u64,
+  /// Number of v2 transactions passed through `scan_transaction` (i.e., "actually scanned").
+  pub txs_scanned: u64,
+  /// Number of outputs iterated over (visited) during scanning.
+  pub outputs_visited: u64,
+  /// Number of ECDH derivations attempted (per output, per candidate tx key).
+  pub ecdh_derivations: u64,
+  /// Number of view-tag mismatches encountered (early reject path).
+  pub viewtag_mismatch: u64,
+  /// Number of commitment verification attempts performed.
+  pub commitment_verify_attempts: u64,
+  /// Number of commitment verification failures (mismatches).
+  pub commitment_verify_fail: u64,
+  /// Number of outputs matched to this wallet.
+  pub outputs_matched: u64,
+  /// Number of failures to parse the transaction `extra` field.
+  pub extra_parse_fail: u64,
+  /// Number of transactions where no tx keys were found in `extra`.
+  pub tx_keys_missing: u64,
+  /// Number of ECDH cache hits (ECDH was reused from the per-tx cache).
+  pub ecdh_cache_hits: u64,
+  /// Number of ECDH cache misses (ECDH had to be computed and inserted into the per-tx cache).
+  pub ecdh_cache_misses: u64,
+  /// Accumulated nanoseconds spent in per-block setup (tx list construction, basic checks).
+  pub ns_block_setup: u64,
+  /// Accumulated nanoseconds spent inside `scan_transaction` (all work within it).
+  pub ns_scan_transaction: u64,
+  /// Accumulated nanoseconds spent in commitment verification work.
+  pub ns_commitment_verify: u64,
+  /// Accumulated nanoseconds spent computing ECDH (view_scalar * tx_pub_key) scalar mul.
+  pub ns_ecdh_mul: u64,
+  /// Accumulated nanoseconds spent computing `SharedKeyDerivations::output_derivations(...)`.
+  pub ns_output_derivations: u64,
+  /// Accumulated nanoseconds spent computing the subaddress spend key and performing the map lookup.
+  pub ns_subaddress_lookup: u64,
+}
+
+#[cfg(feature = "scanner-microprof")]
+/// Return a snapshot of scanner micro-profiler counters/timers.
+///
+/// This API is only compiled when the `scanner-microprof` feature is enabled.
+///
+/// The profiler is additionally gated at runtime by the `MONERO_WALLET_SCANNER_MICROPROF` env var:
+/// - if the env var is not set to a non-zero value, this returns `None`.
+///
+/// If `reset` is `true`, counters are atomically reset to `0` as part of snapshotting.
+pub fn scanner_microprof_snapshot(reset: bool) -> Option<ScannerMicroprofSnapshot> {
+  if !microprof_enabled() {
+    return None;
+  }
+
+  let take = |a: &AtomicU64| -> u64 {
+    if reset {
+      a.swap(0, Ordering::Relaxed)
+    } else {
+      a.load(Ordering::Relaxed)
+    }
+  };
+
+  Some(ScannerMicroprofSnapshot {
+    blocks: take(&MP_BLOCKS),
+    txs_scanned: take(&MP_TXS_SCANNED),
+    outputs_visited: take(&MP_OUTPUTS_VISITED),
+    ecdh_derivations: take(&MP_ECDH_DERIVATIONS),
+    viewtag_mismatch: take(&MP_VIEWTAG_MISMATCH),
+    commitment_verify_attempts: take(&MP_COMMITMENT_VERIFY_ATTEMPTS),
+    commitment_verify_fail: take(&MP_COMMITMENT_VERIFY_FAIL),
+    outputs_matched: take(&MP_OUTPUTS_MATCHED),
+    extra_parse_fail: take(&MP_EXTRA_PARSE_FAIL),
+    tx_keys_missing: take(&MP_TX_KEYS_MISSING),
+    ecdh_cache_hits: take(&MP_ECDH_CACHE_HITS),
+    ecdh_cache_misses: take(&MP_ECDH_CACHE_MISSES),
+    ns_block_setup: take(&MP_NS_BLOCK_SETUP),
+    ns_scan_transaction: take(&MP_NS_SCAN_TRANSACTION),
+    ns_commitment_verify: take(&MP_NS_COMMITMENT_VERIFY),
+    ns_ecdh_mul: take(&MP_NS_ECDH_MUL),
+    ns_output_derivations: take(&MP_NS_OUTPUT_DERIVATIONS),
+    ns_subaddress_lookup: take(&MP_NS_SUBADDRESS_LOOKUP),
+  })
+}
+
+#[cfg(feature = "scanner-microprof")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+#[cfg(feature = "scanner-microprof")]
+use once_cell::sync::Lazy;
+
+#[cfg(feature = "scanner-microprof")]
+static SCANNER_MICROPROF_ENABLED: Lazy<AtomicBool> = Lazy::new(|| {
+  let enabled = std::env::var("MONERO_WALLET_SCANNER_MICROPROF")
+    .ok()
+    .and_then(|s| s.parse::<u8>().ok())
+    .map(|v| v != 0)
+    .unwrap_or(false);
+  AtomicBool::new(enabled)
+});
+
+#[cfg(feature = "scanner-microprof")]
+#[inline(always)]
+fn microprof_enabled() -> bool {
+  SCANNER_MICROPROF_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "scanner-microprof")]
+static MP_BLOCKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_TXS_SCANNED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_OUTPUTS_VISITED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_ECDH_DERIVATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_VIEWTAG_MISMATCH: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_COMMITMENT_VERIFY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_COMMITMENT_VERIFY_FAIL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_OUTPUTS_MATCHED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_EXTRA_PARSE_FAIL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_TX_KEYS_MISSING: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_ECDH_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_ECDH_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "scanner-microprof")]
+static MP_NS_BLOCK_SETUP: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_NS_SCAN_TRANSACTION: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_NS_COMMITMENT_VERIFY: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_NS_ECDH_MUL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_NS_OUTPUT_DERIVATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_NS_SUBADDRESS_LOOKUP: AtomicU64 = AtomicU64::new(0);
 
 /// A collection of potentially additionally timelocked outputs.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -50,8 +203,8 @@ impl Timelocked {
   pub fn additional_timelock_satisfied_by(self, block: usize, time: u64) -> Vec<WalletOutput> {
     let mut res = vec![];
     for output in &self.0 {
-      if (output.additional_timelock() <= Timelock::Block(block)) ||
-        (output.additional_timelock() <= Timelock::Time(time))
+      if (output.additional_timelock() <= Timelock::Block(block))
+        || (output.additional_timelock() <= Timelock::Time(time))
       {
         res.push(output.clone());
       }
@@ -123,60 +276,155 @@ impl InternalScanner {
     tx_hash: [u8; 32],
     tx: &Transaction<Pruned>,
   ) -> Result<Timelocked, ScanError> {
+    #[cfg(feature = "scanner-microprof")]
+    let t0_scan_tx = std::time::Instant::now();
+
     // Only scan TXs creating RingCT outputs
     // For the full details on why this check is equivalent, please see the documentation in `scan`
     if tx.version() != 2 {
+      #[cfg(feature = "scanner-microprof")]
+      {
+        if microprof_enabled() {
+          // still count it as "tx seen", but not "tx scanned"
+          MP_NS_SCAN_TRANSACTION
+            .fetch_add(t0_scan_tx.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+      }
       return Ok(Timelocked(vec![]));
     }
 
+    #[cfg(feature = "scanner-microprof")]
+    {
+      if microprof_enabled() {
+        MP_TXS_SCANNED.fetch_add(1, Ordering::Relaxed);
+      }
+    }
+
+    // Hoist invariants out of the inner loops:
+    // - view scalar conversion (used for ECDH)
+    // - uniqueness (guaranteed scanner mode) derived from tx inputs
+    let dalek_view = Zeroizing::new((*self.pair.view).into());
+    let uniqueness = if self.guaranteed {
+      Some(SharedKeyDerivations::uniqueness(&tx.prefix().inputs))
+    } else {
+      None
+    };
+
+    // Cache ECDH per tx key:
+    // ECDH = view_scalar * tx_pub_key is independent of output index, so compute once per key.
+    #[allow(clippy::type_complexity)]
+    let mut ecdh_cache: HashMap<CompressedPoint, Zeroizing<Point>> = HashMap::new();
+
     // Read the extra field
     let Ok(extra) = Extra::read(&mut tx.prefix().extra.as_slice()) else {
+      #[cfg(feature = "scanner-microprof")]
+      {
+        if microprof_enabled() {
+          MP_EXTRA_PARSE_FAIL.fetch_add(1, Ordering::Relaxed);
+          MP_NS_SCAN_TRANSACTION
+            .fetch_add(t0_scan_tx.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+      }
       return Ok(Timelocked(vec![]));
     };
 
     let Some((tx_keys, additional)) = extra.keys() else {
+      #[cfg(feature = "scanner-microprof")]
+      {
+        if microprof_enabled() {
+          MP_TX_KEYS_MISSING.fetch_add(1, Ordering::Relaxed);
+          MP_NS_SCAN_TRANSACTION
+            .fetch_add(t0_scan_tx.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+      }
       return Ok(Timelocked(vec![]));
     };
     let payment_id = extra.payment_id();
 
     let mut res = vec![];
     for (o, output) in tx.prefix().outputs.iter().enumerate() {
+      #[cfg(feature = "scanner-microprof")]
+      {
+        if microprof_enabled() {
+          MP_OUTPUTS_VISITED.fetch_add(1, Ordering::Relaxed);
+        }
+      }
+
       let Some(output_key) = output.key.decompress() else { continue };
 
       // Monero checks with each TX key and with the additional key for this output
-
-      // This will be None if there's no additional keys, Some(None) if there's additional keys
-      // yet not one for this output (which is non-standard), and Some(Some(_)) if there's an
-      // additional key for this output
-      // https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454
-      //   /src/cryptonote_basic/cryptonote_format_utils.cpp#L1060-L1070
+      // See notes in original code for Monero's behavior.
       let additional = additional.as_ref().and_then(|additional| additional.get(o));
 
       for key in tx_keys.iter().map(Some).chain(core::iter::once(additional)).flatten().copied() {
-        // Calculate the ECDH
-        let ecdh = {
-          let dalek_view = Zeroizing::new((*self.pair.view).into());
-          Zeroizing::new(Point::from(dalek_view.deref() * key.into()))
+        #[cfg(feature = "scanner-microprof")]
+        {
+          if microprof_enabled() {
+            MP_ECDH_DERIVATIONS.fetch_add(1, Ordering::Relaxed);
+          }
+        }
+
+        // Calculate (or reuse cached) ECDH = view_scalar * key.
+        // Cache key is the compressed tx pubkey.
+        let key_comp: CompressedPoint = key.compress();
+        let ecdh: &Zeroizing<Point> = match ecdh_cache.entry(key_comp) {
+          std_shims::collections::hash_map::Entry::Occupied(e) => {
+            #[cfg(feature = "scanner-microprof")]
+            {
+              if microprof_enabled() {
+                MP_ECDH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+              }
+            }
+            e.into_mut()
+          }
+          std_shims::collections::hash_map::Entry::Vacant(e) => {
+            #[cfg(feature = "scanner-microprof")]
+            let t0_ecdh = std::time::Instant::now();
+
+            let computed = Zeroizing::new(Point::from(dalek_view.deref() * key.into()));
+
+            #[cfg(feature = "scanner-microprof")]
+            {
+              if microprof_enabled() {
+                MP_ECDH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+                MP_NS_ECDH_MUL.fetch_add(t0_ecdh.elapsed().as_nanos() as u64, Ordering::Relaxed);
+              }
+            }
+
+            e.insert(computed)
+          }
         };
-        let output_derivations = SharedKeyDerivations::output_derivations(
-          if self.guaranteed {
-            Some(SharedKeyDerivations::uniqueness(&tx.prefix().inputs))
-          } else {
-            None
-          },
-          ecdh.clone(),
-          o,
-        );
+
+        #[cfg(feature = "scanner-microprof")]
+        let t0_deriv = std::time::Instant::now();
+        let output_derivations =
+          SharedKeyDerivations::output_derivations(uniqueness, ecdh.clone(), o);
+        #[cfg(feature = "scanner-microprof")]
+        {
+          if microprof_enabled() {
+            MP_NS_OUTPUT_DERIVATIONS
+              .fetch_add(t0_deriv.elapsed().as_nanos() as u64, Ordering::Relaxed);
+          }
+        }
 
         // Check the view tag matches, if there is a view tag
         if let Some(actual_view_tag) = output.view_tag {
           if actual_view_tag != output_derivations.view_tag {
+            #[cfg(feature = "scanner-microprof")]
+            {
+              if microprof_enabled() {
+                MP_VIEWTAG_MISMATCH.fetch_add(1, Ordering::Relaxed);
+              }
+            }
             continue;
           }
         }
 
         // P - shared == spend
-        let Some(subaddress) = ({
+        #[cfg(feature = "scanner-microprof")]
+        let t0_lookup = std::time::Instant::now();
+
+        let subaddress_opt = {
           // The output key may be of torsion [0, 8)
           // Our subtracting of a prime-order element means any torsion will be preserved
           // If someone wanted to malleate output keys with distinct torsions, only one will be
@@ -186,7 +434,17 @@ impl InternalScanner {
           self
             .subaddresses
             .get::<CompressedPoint>(&subaddress_spend_key.compress().to_bytes().into())
-        }) else {
+        };
+
+        #[cfg(feature = "scanner-microprof")]
+        {
+          if microprof_enabled() {
+            MP_NS_SUBADDRESS_LOOKUP
+              .fetch_add(t0_lookup.elapsed().as_nanos() as u64, Ordering::Relaxed);
+          }
+        }
+
+        let Some(subaddress) = subaddress_opt else {
           continue;
         };
         let subaddress = *subaddress;
@@ -220,15 +478,46 @@ impl InternalScanner {
           };
 
           // Rebuild the commitment to verify it
-          if Some(&commitment.commit().compress()) != proofs.base.commitments.get(o) {
+          #[cfg(feature = "scanner-microprof")]
+          let t0_verify = std::time::Instant::now();
+
+          #[cfg(feature = "scanner-microprof")]
+          {
+            if microprof_enabled() {
+              MP_COMMITMENT_VERIFY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            }
+          }
+
+          let ok = Some(&commitment.commit().compress()) == proofs.base.commitments.get(o);
+
+          #[cfg(feature = "scanner-microprof")]
+          {
+            if microprof_enabled() {
+              MP_NS_COMMITMENT_VERIFY
+                .fetch_add(t0_verify.elapsed().as_nanos() as u64, Ordering::Relaxed);
+              if !ok {
+                MP_COMMITMENT_VERIFY_FAIL.fetch_add(1, Ordering::Relaxed);
+              }
+            }
+          }
+
+          if !ok {
             continue;
           }
         }
 
         // Decrypt the payment ID
-        let payment_id = payment_id.map(|id| id ^ SharedKeyDerivations::payment_id_xor(ecdh));
+        let payment_id =
+          payment_id.map(|id| id ^ SharedKeyDerivations::payment_id_xor(ecdh.clone()));
 
         let o = u64::try_from(o).expect("couldn't convert output index (usize) to u64");
+
+        #[cfg(feature = "scanner-microprof")]
+        {
+          if microprof_enabled() {
+            MP_OUTPUTS_MATCHED.fetch_add(1, Ordering::Relaxed);
+          }
+        }
 
         res.push(WalletOutput {
           absolute_id: AbsoluteId { transaction: tx_hash, index_in_transaction: o },
@@ -254,10 +543,20 @@ impl InternalScanner {
       }
     }
 
+    #[cfg(feature = "scanner-microprof")]
+    {
+      if microprof_enabled() {
+        MP_NS_SCAN_TRANSACTION.fetch_add(t0_scan_tx.elapsed().as_nanos() as u64, Ordering::Relaxed);
+      }
+    }
+
     Ok(Timelocked(res))
   }
 
   fn scan(&mut self, block: ScannableBlock) -> Result<Timelocked, ScanError> {
+    #[cfg(feature = "scanner-microprof")]
+    let t0_setup = std::time::Instant::now();
+
     // This is the output index for the first RingCT output within the block
     // We mutate it to be the output index for the first RingCT for each transaction
     let ScannableBlock { block, transactions, output_index_for_first_ringct_output } = block;
@@ -268,6 +567,12 @@ impl InternalScanner {
     }
     let Some(mut output_index_for_first_ringct_output) = output_index_for_first_ringct_output
     else {
+      #[cfg(feature = "scanner-microprof")]
+      {
+        if microprof_enabled() {
+          MP_NS_BLOCK_SETUP.fetch_add(t0_setup.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+      }
       return Ok(Timelocked(vec![]));
     };
 
@@ -282,6 +587,14 @@ impl InternalScanner {
     )];
     for (hash, tx) in block.transactions.iter().zip(transactions) {
       txs_with_hashes.push((*hash, tx));
+    }
+
+    #[cfg(feature = "scanner-microprof")]
+    {
+      if microprof_enabled() {
+        MP_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        MP_NS_BLOCK_SETUP.fetch_add(t0_setup.elapsed().as_nanos() as u64, Ordering::Relaxed);
+      }
     }
 
     let mut res = Timelocked(vec![]);
