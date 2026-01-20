@@ -438,7 +438,7 @@ impl InternalScanner {
         };
 
         // Derive view tag + shared key. We can avoid computing shared key for view-tag mismatches.
-        let output_derivations = if let Some(actual_view_tag) = output.view_tag {
+        let _output_derivations = if let Some(actual_view_tag) = output.view_tag {
           #[cfg(feature = "scanner-microprof")]
           let t0_deriv = std::time::Instant::now();
 
