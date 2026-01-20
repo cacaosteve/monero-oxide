@@ -217,7 +217,7 @@ impl SignableTransaction {
   pub(crate) fn payment_id_xors(&self) -> Vec<[u8; 8]> {
     let mut res = Vec::with_capacity(self.payments.len());
     for ecdh in self.ecdhs() {
-      res.push(SharedKeyDerivations::payment_id_xor(&ecdh));
+      res.push(SharedKeyDerivations::payment_id_xor(ecdh));
     }
     res
   }
