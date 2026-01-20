@@ -20,6 +20,9 @@ workspace = true
 
 [dependencies]
 
+# Faster hashing for hot-path HashMap usage (ECDH cache).
+ahash = { version = "0.8", default-features = false, features = ["std"] }
+
 # Optional dependency used only when the scanner micro-profiler feature is enabled.
 once_cell = { version = "1", optional = true }
 std-shims = { version = "0.1.5", default-features = false }

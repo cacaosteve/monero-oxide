@@ -3,6 +3,8 @@ use std_shims::{collections::HashMap, vec, vec::Vec};
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use ahash::RandomState;
+
 #[cfg(feature = "compile-time-generators")]
 use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 #[cfg(not(feature = "compile-time-generators"))]
@@ -61,6 +63,11 @@ pub struct ScannerMicroprofSnapshot {
   pub ns_commitment_verify: u64,
   /// Accumulated nanoseconds spent computing ECDH (view_scalar * tx_pub_key) scalar mul.
   pub ns_ecdh_mul: u64,
+  /// Accumulated nanoseconds spent doing HashMap lookup for the ECDH cache on cache hits.
+  pub ns_ecdh_cache_lookup_hit: u64,
+  /// Accumulated nanoseconds spent doing HashMap lookup + insertion bookkeeping for the ECDH cache on cache misses.
+  /// This does *not* include the scalar multiplication time tracked by `ns_ecdh_mul`.
+  pub ns_ecdh_cache_lookup_miss: u64,
   /// Accumulated nanoseconds spent computing `SharedKeyDerivations::output_derivations(...)`.
   pub ns_output_derivations: u64,
   /// Accumulated nanoseconds spent computing the subaddress spend key and performing the map lookup.
@@ -106,6 +113,8 @@ pub fn scanner_microprof_snapshot(reset: bool) -> Option<ScannerMicroprofSnapsho
     ns_scan_transaction: take(&MP_NS_SCAN_TRANSACTION),
     ns_commitment_verify: take(&MP_NS_COMMITMENT_VERIFY),
     ns_ecdh_mul: take(&MP_NS_ECDH_MUL),
+    ns_ecdh_cache_lookup_hit: take(&MP_NS_ECDH_CACHE_LOOKUP_HIT),
+    ns_ecdh_cache_lookup_miss: take(&MP_NS_ECDH_CACHE_LOOKUP_MISS),
     ns_output_derivations: take(&MP_NS_OUTPUT_DERIVATIONS),
     ns_subaddress_lookup: take(&MP_NS_SUBADDRESS_LOOKUP),
   })
@@ -166,6 +175,10 @@ static MP_NS_SCAN_TRANSACTION: AtomicU64 = AtomicU64::new(0);
 static MP_NS_COMMITMENT_VERIFY: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "scanner-microprof")]
 static MP_NS_ECDH_MUL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_NS_ECDH_CACHE_LOOKUP_HIT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "scanner-microprof")]
+static MP_NS_ECDH_CACHE_LOOKUP_MISS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "scanner-microprof")]
 static MP_NS_OUTPUT_DERIVATIONS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "scanner-microprof")]
@@ -313,7 +326,8 @@ impl InternalScanner {
     // Cache ECDH per tx key:
     // ECDH = view_scalar * tx_pub_key is independent of output index, so compute once per key.
     #[allow(clippy::type_complexity)]
-    let mut ecdh_cache: HashMap<CompressedPoint, Zeroizing<Point>> = HashMap::new();
+    let mut ecdh_cache: HashMap<CompressedPoint, Zeroizing<Point>, RandomState> =
+      HashMap::with_hasher(RandomState::new());
 
     // Read the extra field
     let Ok(extra) = Extra::read(&mut tx.prefix().extra.as_slice()) else {
@@ -367,17 +381,34 @@ impl InternalScanner {
         // Calculate (or reuse cached) ECDH = view_scalar * key.
         // Cache key is the compressed tx pubkey.
         let key_comp: CompressedPoint = key.compress();
+
+        #[cfg(feature = "scanner-microprof")]
+        let t0_cache_lookup = std::time::Instant::now();
+
         let ecdh: &Zeroizing<Point> = match ecdh_cache.entry(key_comp) {
           std_shims::collections::hash_map::Entry::Occupied(e) => {
             #[cfg(feature = "scanner-microprof")]
             {
               if microprof_enabled() {
                 MP_ECDH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                MP_NS_ECDH_CACHE_LOOKUP_HIT
+                  .fetch_add(t0_cache_lookup.elapsed().as_nanos() as u64, Ordering::Relaxed);
               }
             }
             e.into_mut()
           }
           std_shims::collections::hash_map::Entry::Vacant(e) => {
+            #[cfg(feature = "scanner-microprof")]
+            {
+              if microprof_enabled() {
+                MP_ECDH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+                // Attribute time spent up to this point as "lookup miss overhead"
+                // (hashing + table probe + entry setup), excluding the scalar mul itself.
+                MP_NS_ECDH_CACHE_LOOKUP_MISS
+                  .fetch_add(t0_cache_lookup.elapsed().as_nanos() as u64, Ordering::Relaxed);
+              }
+            }
+
             #[cfg(feature = "scanner-microprof")]
             let t0_ecdh = std::time::Instant::now();
 
@@ -386,7 +417,6 @@ impl InternalScanner {
             #[cfg(feature = "scanner-microprof")]
             {
               if microprof_enabled() {
-                MP_ECDH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
                 MP_NS_ECDH_MUL.fetch_add(t0_ecdh.elapsed().as_nanos() as u64, Ordering::Relaxed);
               }
             }
@@ -395,21 +425,23 @@ impl InternalScanner {
           }
         };
 
-        #[cfg(feature = "scanner-microprof")]
-        let t0_deriv = std::time::Instant::now();
-        let output_derivations =
-          SharedKeyDerivations::output_derivations(uniqueness, ecdh.clone(), o);
-        #[cfg(feature = "scanner-microprof")]
-        {
-          if microprof_enabled() {
-            MP_NS_OUTPUT_DERIVATIONS
-              .fetch_add(t0_deriv.elapsed().as_nanos() as u64, Ordering::Relaxed);
-          }
-        }
+        // Derive view tag + shared key. We can avoid computing shared key for view-tag mismatches.
+        let output_derivations = if let Some(actual_view_tag) = output.view_tag {
+          #[cfg(feature = "scanner-microprof")]
+          let t0_deriv = std::time::Instant::now();
 
-        // Check the view tag matches, if there is a view tag
-        if let Some(actual_view_tag) = output.view_tag {
-          if actual_view_tag != output_derivations.view_tag {
+          // Fast path: compute only the expected view tag first.
+          let expected_view_tag = SharedKeyDerivations::output_view_tag(&*ecdh, o);
+
+          #[cfg(feature = "scanner-microprof")]
+          {
+            if microprof_enabled() {
+              MP_NS_OUTPUT_DERIVATIONS
+                .fetch_add(t0_deriv.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+          }
+
+          if actual_view_tag != expected_view_tag {
             #[cfg(feature = "scanner-microprof")]
             {
               if microprof_enabled() {
@@ -418,7 +450,38 @@ impl InternalScanner {
             }
             continue;
           }
-        }
+
+          // Only compute shared_key once the view tag matches.
+          #[cfg(feature = "scanner-microprof")]
+          let t0_deriv2 = std::time::Instant::now();
+          let shared_key = SharedKeyDerivations::output_shared_key(uniqueness, &*ecdh, o);
+          #[cfg(feature = "scanner-microprof")]
+          {
+            if microprof_enabled() {
+              MP_NS_OUTPUT_DERIVATIONS
+                .fetch_add(t0_deriv2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+          }
+
+          SharedKeyDerivations { view_tag: expected_view_tag, shared_key }
+        } else {
+          // No view tag available: fall back to deriving both values in one pass.
+          #[cfg(feature = "scanner-microprof")]
+          let t0_deriv = std::time::Instant::now();
+          let output_derivations = SharedKeyDerivations::output_derivations(uniqueness, &*ecdh, o);
+          #[cfg(feature = "scanner-microprof")]
+          {
+            if microprof_enabled() {
+              MP_NS_OUTPUT_DERIVATIONS
+                .fetch_add(t0_deriv.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+          }
+          // Avoid moving out of Zeroizing; just read fields through Deref.
+          SharedKeyDerivations {
+            view_tag: output_derivations.view_tag,
+            shared_key: output_derivations.shared_key,
+          }
+        };
 
         // P - shared == spend
         #[cfg(feature = "scanner-microprof")]
@@ -507,8 +570,7 @@ impl InternalScanner {
         }
 
         // Decrypt the payment ID
-        let payment_id =
-          payment_id.map(|id| id ^ SharedKeyDerivations::payment_id_xor(ecdh.clone()));
+        let payment_id = payment_id.map(|id| id ^ SharedKeyDerivations::payment_id_xor(&*ecdh));
 
         let o = u64::try_from(o).expect("couldn't convert output index (usize) to u64");
 
