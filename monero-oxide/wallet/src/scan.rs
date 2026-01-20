@@ -1,5 +1,5 @@
-use core::ops::Deref;
-use std_shims::{collections::HashMap, vec, vec::Vec};
+use core::ops::Deref as _;
+use std_shims::{vec, vec::Vec, collections::HashMap};
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -253,6 +253,7 @@ struct InternalScanner {
 }
 
 impl Zeroize for InternalScanner {
+  #[expect(clippy::iter_over_hash_type)]
   fn zeroize(&mut self) {
     self.pair.zeroize();
     self.guaranteed.zeroize();
@@ -364,6 +365,17 @@ impl InternalScanner {
         }
       }
 
+      /*
+        Explicitly skip keys which are the identity.
+
+        These are theoretically able to be scanned (with negligible probability except for a
+        recipient who chooses their keys as to cause this), but are unspendable due to restrictions
+        the key image isn't the identity point (in place since the RingCT upgrade).
+      */
+      if output.key == CompressedPoint::IDENTITY {
+        continue;
+      }
+
       let Some(output_key) = output.key.decompress() else { continue };
 
       // Monero checks with each TX key and with the additional key for this output
@@ -377,6 +389,111 @@ impl InternalScanner {
             MP_ECDH_DERIVATIONS.fetch_add(1, Ordering::Relaxed);
           }
         }
+
+        // Calculate (or reuse cached) ECDH = view_scalar * key.
+        // Cache key is the compressed tx pubkey.
+        let key_comp: CompressedPoint = key.compress();
+
+        #[cfg(feature = "scanner-microprof")]
+        let t0_cache_lookup = std::time::Instant::now();
+
+        let ecdh: &Zeroizing<Point> = match ecdh_cache.entry(key_comp) {
+          std_shims::collections::hash_map::Entry::Occupied(e) => {
+            #[cfg(feature = "scanner-microprof")]
+            {
+              if microprof_enabled() {
+                MP_ECDH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                MP_NS_ECDH_CACHE_LOOKUP_HIT
+                  .fetch_add(t0_cache_lookup.elapsed().as_nanos() as u64, Ordering::Relaxed);
+              }
+            }
+            e.into_mut()
+          }
+          std_shims::collections::hash_map::Entry::Vacant(e) => {
+            #[cfg(feature = "scanner-microprof")]
+            {
+              if microprof_enabled() {
+                MP_ECDH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+                // Attribute time spent up to this point as "lookup miss overhead"
+                // (hashing + table probe + entry setup), excluding the scalar mul itself.
+                MP_NS_ECDH_CACHE_LOOKUP_MISS
+                  .fetch_add(t0_cache_lookup.elapsed().as_nanos() as u64, Ordering::Relaxed);
+              }
+            }
+
+            #[cfg(feature = "scanner-microprof")]
+            let t0_ecdh = std::time::Instant::now();
+
+            let computed = Zeroizing::new(Point::from(dalek_view.deref() * key.into()));
+
+            #[cfg(feature = "scanner-microprof")]
+            {
+              if microprof_enabled() {
+                MP_NS_ECDH_MUL.fetch_add(t0_ecdh.elapsed().as_nanos() as u64, Ordering::Relaxed);
+              }
+            }
+
+            e.insert(computed)
+          }
+        };
+
+        // Derive view tag + shared key. We can avoid computing shared key for view-tag mismatches.
+        let output_derivations = if let Some(actual_view_tag) = output.view_tag {
+          #[cfg(feature = "scanner-microprof")]
+          let t0_deriv = std::time::Instant::now();
+
+          // Fast path: compute only the expected view tag first.
+          let expected_view_tag = SharedKeyDerivations::output_view_tag(&*ecdh, o);
+
+          #[cfg(feature = "scanner-microprof")]
+          {
+            if microprof_enabled() {
+              MP_NS_OUTPUT_DERIVATIONS
+                .fetch_add(t0_deriv.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+          }
+
+          if actual_view_tag != expected_view_tag {
+            #[cfg(feature = "scanner-microprof")]
+            {
+              if microprof_enabled() {
+                MP_VIEWTAG_MISMATCH.fetch_add(1, Ordering::Relaxed);
+              }
+            }
+            continue;
+          }
+
+          // Only compute shared_key once the view tag matches.
+          #[cfg(feature = "scanner-microprof")]
+          let t0_deriv2 = std::time::Instant::now();
+          let shared_key = SharedKeyDerivations::output_shared_key(uniqueness, &*ecdh, o);
+          #[cfg(feature = "scanner-microprof")]
+          {
+            if microprof_enabled() {
+              MP_NS_OUTPUT_DERIVATIONS
+                .fetch_add(t0_deriv2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+          }
+
+          SharedKeyDerivations { view_tag: expected_view_tag, shared_key }
+        } else {
+          // No view tag available: fall back to deriving both values in one pass.
+          #[cfg(feature = "scanner-microprof")]
+          let t0_deriv = std::time::Instant::now();
+          let output_derivations = SharedKeyDerivations::output_derivations(uniqueness, &*ecdh, o);
+          #[cfg(feature = "scanner-microprof")]
+          {
+            if microprof_enabled() {
+              MP_NS_OUTPUT_DERIVATIONS
+                .fetch_add(t0_deriv.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+          }
+          // Avoid moving out of Zeroizing; just read fields through Deref.
+          SharedKeyDerivations {
+            view_tag: output_derivations.view_tag,
+            shared_key: output_derivations.shared_key,
+          }
+        };
 
         // Calculate (or reuse cached) ECDH = view_scalar * key.
         // Cache key is the compressed tx pubkey.
@@ -570,7 +687,8 @@ impl InternalScanner {
         }
 
         // Decrypt the payment ID
-        let payment_id = payment_id.map(|id| id ^ SharedKeyDerivations::payment_id_xor(&*ecdh));
+        let payment_id =
+          payment_id.map(|id| id ^ SharedKeyDerivations::payment_id_xor(ecdh.clone()));
 
         let o = u64::try_from(o).expect("couldn't convert output index (usize) to u64");
 
@@ -724,7 +842,7 @@ impl Scanner {
   /// This function runs in variable time, notably with regards to the distribution of subaddress
   /// derivations (which should be reasonably uniform) and the amount of subaddresses registered.
   pub fn register_subaddress(&mut self, subaddress: SubaddressIndex) {
-    self.0.register_subaddress(subaddress)
+    self.0.register_subaddress(subaddress);
   }
 
   /// Scan a block.
@@ -759,7 +877,7 @@ impl GuaranteedScanner {
   /// This function runs in variable time, notably with regards to the distribution of subaddress
   /// derivations (which should be reasonably uniform) and the amount of subaddresses registered.
   pub fn register_subaddress(&mut self, subaddress: SubaddressIndex) {
-    self.0.register_subaddress(subaddress)
+    self.0.register_subaddress(subaddress);
   }
 
   /// Scan a block.

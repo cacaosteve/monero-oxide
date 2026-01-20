@@ -1,9 +1,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
-#![deny(missing_docs)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use sha3::{Digest, Keccak256};
+use sha3::{Digest as _, Keccak256};
 
 /// Re-export `sha3::Digest` so downstream crates can use `Keccak256::update(...)` without adding a
 /// direct `sha3` dependency.

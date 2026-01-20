@@ -30,7 +30,7 @@ impl PrunedTransactionWithPrunableHash {
     match &transaction {
       Transaction::V1 { .. } => {
         if prunable_hash.is_some() {
-          None?
+          None?;
         }
       }
       Transaction::V2 { proofs, .. } => {

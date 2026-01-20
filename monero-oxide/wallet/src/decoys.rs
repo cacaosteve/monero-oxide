@@ -1,8 +1,13 @@
-use std_shims::{io, vec::Vec, string::ToString, collections::HashSet};
+#![expect(clippy::as_conversions, clippy::float_arithmetic)]
+
+use std_shims::{prelude::*, io, vec::Vec, collections::HashSet};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use rand_core::{RngCore, CryptoRng};
+use rand_distr::{Distribution as _, Gamma};
+#[cfg(not(feature = "std"))]
+use rand_distr::num_traits::Float;
 
 use crate::{
   DEFAULT_LOCK_WINDOW, COINBASE_LOCK_WINDOW, BLOCK_TIME,
@@ -15,30 +20,50 @@ use crate::{
 
 const RECENT_WINDOW: u64 = 15;
 const BLOCKS_PER_YEAR: usize = (365 * 24 * 60 * 60) / BLOCK_TIME;
+#[expect(clippy::cast_precision_loss)]
+const TIP_APPLICATION: f64 = (DEFAULT_LOCK_WINDOW * BLOCK_TIME) as f64;
 
 async fn select_n(
   rng: &mut (impl RngCore + CryptoRng),
   rpc: &impl ProvidesDecoys,
-  mut block_number: usize,
+  block_number: usize,
   output_being_spent: &WalletOutput,
   ring_len: u8,
   fingerprintable_deterministic: bool,
 ) -> Result<Vec<(u64, [Point; 2])>, TransactionsError> {
   if block_number <= DEFAULT_LOCK_WINDOW {
-    Err(InterfaceError::InternalError("not enough blocks to select decoys".to_string()))?;
+    Err(InterfaceError::InternalError("not enough blocks to select decoys".to_owned()))?;
   }
-  // Normally, we reject requests when the caller's `block_number` exceeds the daemon's tip.
-  //
-  // However, when `get_output_distribution` is unavailable and we fall back to uniform sampling,
-  // this strict check can become a false-negative (callers may pass a snapshot height which is
-  // slightly ahead/behind due to racing height reads).
-  //
-  // We still keep a basic sanity check that the chain has advanced past the lock window.
-  let daemon_tip = rpc.latest_block_number().await?;
-  if block_number > daemon_tip {
-    // Clamp instead of failing.
-    block_number = daemon_tip;
+  if block_number > rpc.latest_block_number().await? {
+    Err(InterfaceError::InternalError(
+      "decoys being requested from blocks this node doesn't have".to_owned(),
+    ))?;
   }
+
+  // Get the distribution
+  let distribution = rpc.ringct_output_distribution(..=block_number).await?;
+  if distribution.len() < DEFAULT_LOCK_WINDOW {
+    Err(InterfaceError::InternalError("not enough blocks to select decoys".to_owned()))?;
+  }
+  let highest_output_exclusive_bound = distribution[distribution.len() - DEFAULT_LOCK_WINDOW];
+
+  // This assumes that each miner TX had one output (as sane) and checks we have sufficient
+  // outputs even when excluding them (due to their own timelock requirements)
+  if highest_output_exclusive_bound.saturating_sub(
+    u64::try_from(COINBASE_LOCK_WINDOW).expect("coinbase lock window exceeds 2^{64}"),
+  ) < u64::from(ring_len)
+  {
+    Err(InterfaceError::InternalError("not enough decoy candidates".to_owned()))?;
+  }
+
+  // Determine the outputs per second
+  #[expect(clippy::cast_precision_loss)]
+  let per_second = {
+    let blocks = distribution.len().min(BLOCKS_PER_YEAR);
+    let initial = distribution[distribution.len().saturating_sub(blocks + 1)];
+    let outputs = distribution[distribution.len() - 1].saturating_sub(initial);
+    (outputs as f64) / ((blocks * BLOCK_TIME) as f64)
+  };
 
   let output_being_spent_index = output_being_spent.relative_id.index_on_blockchain;
 
@@ -49,138 +74,65 @@ async fn select_n(
   let decoy_count = usize::from(ring_len - 1);
   let mut res = Vec::with_capacity(decoy_count);
 
-  // Standard path: uses `ringct_output_distribution(..=block_number)` to sample outputs with the
-  // Gamma-based algorithm.
-  //
-  // Fallback path: some daemons fail `get_output_distribution(.bin)` with:
-  //   code=-5, message="Failed to get output distribution"
-  //
-  // For those daemons, we fall back to uniform sampling over `[0, N)` where `N` is the number of
-  // RingCT outputs. Since `ProvidesDecoys` doesn't expose histogram directly, we fetch `N` by
-  // requesting a tiny range of the output distribution (0..=1) and taking its last element.
-  // (This is intentionally small so providers can implement it using histogram internally.)
-  let (distribution, highest_output_exclusive_bound) =
-    match rpc.ringct_output_distribution(..=block_number).await {
-      Ok(distribution) => {
-        if distribution.len() < DEFAULT_LOCK_WINDOW {
-          Err(InterfaceError::InternalError("not enough blocks to select decoys".to_string()))?;
-        }
-
-        let highest_output_exclusive_bound = distribution[distribution.len() - DEFAULT_LOCK_WINDOW];
-
-        // This assumes that each miner TX had one output (as sane) and checks we have sufficient
-        // outputs even when excluding them (due to their own timelock requirements)
-        if highest_output_exclusive_bound.saturating_sub(
-          u64::try_from(COINBASE_LOCK_WINDOW).expect("coinbase lock window exceeds 2^{64}"),
-        ) < u64::from(ring_len)
-        {
-          Err(InterfaceError::InternalError("not enough decoy candidates".to_string()))?;
-        }
-
-        (Some(distribution), Some(highest_output_exclusive_bound))
-      }
-      Err(_e) => (None, None),
-    };
-
-  let total_instances_fallback_bound: Option<u64> = if distribution.is_none() {
-    match rpc.ringct_output_distribution(0usize..=1usize).await {
-      Ok(dist) => dist.last().copied(),
-      Err(_e) => None,
-    }
-  } else {
-    None
-  };
-
   let mut first_iter = true;
   let mut iters = 0;
   while res.len() != decoy_count {
     {
       iters += 1;
-      #[cfg(not(test))]
-      const MAX_ITERS: usize = 10;
-      #[cfg(test)]
-      const MAX_ITERS: usize = 1000;
-      if iters == MAX_ITERS {
-        Err(InterfaceError::InternalError("hit decoy selection round limit".to_string()))?;
+      const MAX_ITERS: usize = {
+        #[cfg_attr(test, expect(unused))]
+        let max_iters = 10;
+        // When testing on fresh chains, increased iterations can be useful and we don't
+        // necessitate reasonable performance
+        #[cfg(test)]
+        let max_iters = 1000;
+        max_iters
+      };
+
+      // Ensure this isn't infinitely looping
+      if (iters == MAX_ITERS)
+        || ((highest_output_exclusive_bound
+          - u64::try_from(do_not_select.len()).expect("amount of ignored decoys exceeds 2^{64}"))
+          < u64::from(ring_len))
+      {
+        Err(InterfaceError::InternalError("hit decoy selection round limit".to_owned()))?;
       }
     }
 
     let remaining = decoy_count - res.len();
     let mut candidates = Vec::with_capacity(remaining);
 
-    match (&distribution, highest_output_exclusive_bound) {
-      // Distribution-based selection (existing behavior).
-      (Some(distribution), Some(highest_output_exclusive_bound)) => {
-        // Determine the outputs per second
-        #[allow(clippy::cast_precision_loss)]
-        let per_second = {
-          let blocks = distribution.len().min(BLOCKS_PER_YEAR);
-          let initial = distribution[distribution.len().saturating_sub(blocks + 1)];
-          let outputs = distribution[distribution.len() - 1].saturating_sub(initial);
-          (outputs as f64) / ((blocks * BLOCK_TIME) as f64)
-        };
-
-        #[allow(clippy::cast_precision_loss)]
-        const TIP_APPLICATION: f64 = (DEFAULT_LOCK_WINDOW * BLOCK_TIME) as f64;
-
-        use rand_distr::{Distribution, Gamma};
-        #[cfg(not(feature = "std"))]
-        use rand_distr::num_traits::Float;
-
-        while candidates.len() != remaining {
-          // Use a gamma distribution, as Monero does
-          // https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c45
-          //   /src/wallet/wallet2.cpp#L142-L143
-          let mut age = Gamma::<f64>::new(19.28, 1.0 / 1.61)
-            .expect("constant Gamma distribution could no longer be created")
-            .sample(rng)
-            .exp();
-          #[allow(clippy::cast_precision_loss)]
-          if age > TIP_APPLICATION {
-            age -= TIP_APPLICATION;
-          } else {
-            age = (rng.next_u64()
-              % (RECENT_WINDOW * u64::try_from(BLOCK_TIME).expect("BLOCK_TIME exceeded u64::MAX")))
-              as f64;
-          }
-
-          #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-          let o = (age * per_second) as u64;
-          if o < highest_output_exclusive_bound {
-            // Find which block this points to
-            let i = distribution.partition_point(|s| *s < (highest_output_exclusive_bound - 1 - o));
-            let prev = i.saturating_sub(1);
-            let n = distribution[i].checked_sub(distribution[prev]).ok_or_else(|| {
-              InterfaceError::InternalError("RPC returned non-monotonic distribution".to_string())
-            })?;
-            if n != 0 {
-              // Select an output from within this block
-              let o = distribution[prev] + (rng.next_u64() % n);
-              if !do_not_select.contains(&o) {
-                candidates.push(o);
-                do_not_select.insert(o);
-              }
-            }
-          }
-        }
+    while candidates.len() != remaining {
+      // Use a gamma distribution, as Monero does
+      // https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c45
+      //   /src/wallet/wallet2.cpp#L142-L143
+      let mut age = Gamma::<f64>::new(19.28, 1.0 / 1.61)
+        .expect("constant Gamma distribution could no longer be created")
+        .sample(rng)
+        .exp();
+      #[expect(clippy::cast_precision_loss)]
+      if age > TIP_APPLICATION {
+        age -= TIP_APPLICATION;
+      } else {
+        // f64 does not have try_from available, which is why these are written with `as`
+        age = (rng.next_u64()
+          % (RECENT_WINDOW * u64::try_from(BLOCK_TIME).expect("BLOCK_TIME exceeded u64::MAX")))
+          as f64;
       }
 
-      // Fallback: uniform sampling over `[0, N)` where `N` is derived from a tiny distribution query
-      // which providers can implement via histogram if needed.
-      _ => {
-        let n = total_instances_fallback_bound.ok_or_else(|| {
-          InterfaceError::InternalError(
-            "failed to get output distribution; couldn't derive fallback total_instances"
-              .to_string(),
-          )
+      #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+      let o = (age * per_second) as u64;
+      if o < highest_output_exclusive_bound {
+        // Find which block this points to
+        let i = distribution.partition_point(|s| *s < (highest_output_exclusive_bound - 1 - o));
+        let prev = i.saturating_sub(1);
+        let n = distribution[i].checked_sub(distribution[prev]).ok_or_else(|| {
+          InterfaceError::InternalError("RPC returned non-monotonic distribution".to_owned())
         })?;
 
-        if n < u64::from(ring_len) {
-          Err(InterfaceError::InternalError("not enough decoy candidates".to_string()))?;
-        }
-
-        while candidates.len() != remaining {
-          let o = rng.next_u64() % n;
+        if n != 0 {
+          // Select an output from within this block
+          let o = distribution[prev] + (rng.next_u64() % n);
           if !do_not_select.contains(&o) {
             candidates.push(o);
             do_not_select.insert(o);
@@ -190,19 +142,18 @@ async fn select_n(
     }
 
     // If this is the first time we're requesting these outputs, include the real one as well
-    let real_index = if first_iter {
+    // Prevents the node we're connected to from having a list of known decoys and then seeing a
+    // TX which uses all of them, with one additional output (the true spend)
+    let real_index = first_iter.then(|| {
       first_iter = false;
 
       candidates.push(output_being_spent_index);
-      candidates.sort();
-      Some(
-        candidates
-          .binary_search(&output_being_spent_index)
-          .expect("selected a ring which didn't include the real spend"),
-      )
-    } else {
-      None
-    };
+      // Sort candidates so the real spends aren't the ones at the end
+      candidates.sort_unstable();
+      candidates
+        .binary_search(&output_being_spent_index)
+        .expect("selected a ring which didn't include the real spend")
+    });
 
     for (i, output) in rpc
       .unlocked_ringct_outputs(
@@ -223,7 +174,7 @@ async fn select_n(
             != output.map(|[_key, commitment]| commitment))
         {
           Err(InterfaceError::InvalidInterface(
-            "node presented different view of output we're trying to spend".to_string(),
+            "node presented different view of output we're trying to spend".to_owned(),
           ))?;
         }
 
@@ -233,7 +184,20 @@ async fn select_n(
       if let Some(output) = output.take() {
         {
           let [key, commitment] = output;
+          // Unless torsion is present
+          // https://github.com/monero-project/monero/blob/893916ad091a92e765ce3241b94e706ad012b62a
+          //   /src/wallet/wallet2.cpp#L9050-L9060
           if !(key.into().is_torsion_free() && commitment.into().is_torsion_free()) {
+            continue;
+          }
+          /*
+            Or the key is the identity, and accordingly cannot be signed for as a real ring member.
+
+            If Monero omits this check, then transactions may technically be fingerprinted as from
+            `wallet2` (and not `monero-wallet`). We accept this (arguable) fingerprint.
+          */
+          use curve25519_dalek::traits::IsIdentity as _;
+          if key.into().is_identity() {
             continue;
           }
         }
@@ -254,7 +218,7 @@ async fn select_decoys<R: RngCore + CryptoRng>(
   fingerprintable_deterministic: bool,
 ) -> Result<Decoys, TransactionsError> {
   if ring_len == 0 {
-    Err(InterfaceError::InternalError("requesting a ring of length 0".to_string()))?;
+    Err(InterfaceError::InternalError("requesting a ring of length 0".to_owned()))?;
   }
 
   // Select all decoys for this transaction, assuming we generate a sane transaction
