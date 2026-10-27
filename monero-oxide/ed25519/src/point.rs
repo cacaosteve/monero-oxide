@@ -54,12 +54,12 @@ impl Point {
   /// derivative of their `u` coordinates (in Montgomery form) are quadratic residues. It's biased
   /// accordingly. The yielded points SHOULD still have uniform relations to each other however.
   pub fn biased_hash(bytes: [u8; 32]) -> Self {
-    use crypto_bigint::{Encoding as _, modular::constant_mod::*, U256, impl_modulus, const_residue};
+    use crypto_bigint::{modular::ConstMontyForm, U256, const_monty_params};
 
     const MODULUS_STR: &str = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed";
-    impl_modulus!(Two25519, U256, MODULUS_STR);
+    const_monty_params!(Two25519, U256, MODULUS_STR);
 
-    type Two25519Residue = Residue<Two25519, { U256::LIMBS }>;
+    type Two25519Residue = ConstMontyForm<Two25519, { U256::LIMBS }>;
 
     /*
       Curve25519 is a Montgomery curve with equation `v^2 = u^3 + 486662 u^2 + u`.
@@ -68,7 +68,7 @@ impl Point {
       `(sqrt(-(A + 2)) u / v, (u - 1) / (u + 1))`.
     */
     const A_U256: U256 = U256::from_u64(486_662);
-    const A: Two25519Residue = const_residue!(A_U256, Two25519);
+    const A: Two25519Residue = Two25519Residue::new(&A_U256);
     const NEGATIVE_A: Two25519Residue = A.neg();
 
     // Sample a uniform field element
@@ -83,7 +83,7 @@ impl Point {
 
       which is of negligible probability.
     */
-    let r = Two25519Residue::new(&U256::from_le_bytes(Keccak256::digest(bytes).into()));
+    let r = Two25519Residue::new(&U256::from_le_slice(&Keccak256::digest(bytes)));
 
     // Per Section 5.5, take `u = 2`. This is the smallest quadratic non-residue in the field
     let r_square = r.square();
@@ -98,7 +98,9 @@ impl Point {
       ```
     */
     let one_plus_ur_square = Two25519Residue::ONE + ur_square;
-    let (one_plus_ur_square_inv, _value_was_zero) = one_plus_ur_square.invert();
+    // The denominator is provably non-zero (above). Extract the constant-time
+    // inverse without introducing a data-dependent Option branch.
+    let one_plus_ur_square_inv = one_plus_ur_square.invert().to_inner_unchecked();
     let upsilon = NEGATIVE_A * one_plus_ur_square_inv;
     /*
       Quoting section 5.5,
@@ -114,10 +116,12 @@ impl Point {
     // RFC-8032 provides `sqrt8k5`
     fn is_quadratic_residue_8_mod_5(value: &Two25519Residue) -> Choice {
       // (p + 3) // 8
-      const SQRT_EXP: U256 = Two25519::MODULUS.shr_vartime(3).wrapping_add(&U256::ONE);
+      const SQRT_EXP: U256 =
+        Two25519Residue::MODULUS.as_ref().shr_vartime(3).wrapping_add(&U256::ONE);
       // 2^{(p - 1) // 4}
-      const Z: Two25519Residue =
-        Two25519Residue::ONE.add(&Two25519Residue::ONE).pow(&Two25519::MODULUS.shr_vartime(2));
+      const Z: Two25519Residue = Two25519Residue::ONE
+        .add(&Two25519Residue::ONE)
+        .pow(&Two25519Residue::MODULUS.as_ref().shr_vartime(2));
       let y = value.pow(&SQRT_EXP);
       let other_candidate = y * Z;
       // If `value` is a quadratic residue, one of these will be its square root
@@ -137,7 +141,7 @@ impl Point {
       `v` coordinate if `\upsilon` was chosen (as signaled by `\epsilon = 1`). The following
       chooses the odd `y` coordinate if `\upsilon` was chosen, which is functionally equivalent.
     */
-    let res = curve25519_dalek::MontgomeryPoint(u.retrieve().to_le_bytes())
+    let res = curve25519_dalek::MontgomeryPoint(u.retrieve().to_le_bytes().into())
       .to_edwards(epsilon.unwrap_u8())
       .expect("neither Elligator 2 candidate was a square");
 

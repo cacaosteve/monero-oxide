@@ -37,6 +37,8 @@ jobs:
             GITHUB_CI=true RUST_BACKTRACE=1 cargo test --manifest-path "$manifest" --lib
             GITHUB_CI=true RUST_BACKTRACE=1 cargo test --manifest-path "$manifest" --lib --all-features
           done
+      - name: Hash-to-point reference and legacy compatibility vectors
+        run: cargo test --locked -p monero-ed25519 --test biased_hash --release
 
   integration-tests:
     strategy:
