@@ -34,6 +34,90 @@ macro_rules! epee_key_len {
 mod blocks_bin;
 
 impl<T: HttpTransport> MoneroDaemon<T> {
+  /// Fetch one bounded RingCT output-distribution range.
+  ///
+  /// Cuprate and monerod return an empty distribution when the requested range is entirely
+  /// before RingCT activation. In that case `start_height` is after `to`, which is represented
+  /// here as an empty vector so callers can move on to the next range.
+  async fn ringct_output_distribution_range(
+    &self,
+    from: usize,
+    to: usize,
+  ) -> Result<Vec<u64>, InterfaceError> {
+    let zero_zero_case = (from == 0) && (to == 0);
+    let request_to = if zero_zero_case { 1 } else { to };
+
+    #[expect(clippy::as_conversions)]
+    let request = [
+      epee::HEADER.as_slice(),
+      &[epee::VERSION],
+      &[5 << 2],
+      &[epee_key_len!("from_height")],
+      "from_height".as_bytes(),
+      &[epee::Type::Uint64 as u8],
+      &u64::try_from(from)
+        .map_err(|_| {
+          InterfaceError::InternalError("range's from wasn't representable as a `u64`".to_owned())
+        })?
+        .to_le_bytes(),
+      &[epee_key_len!("to_height")],
+      "to_height".as_bytes(),
+      &[epee::Type::Uint64 as u8],
+      &u64::try_from(request_to)
+        .map_err(|_| {
+          InterfaceError::InternalError("range's to wasn't representable as a `u64`".to_owned())
+        })?
+        .to_le_bytes(),
+      &[epee_key_len!("cumulative")],
+      "cumulative".as_bytes(),
+      &[epee::Type::Bool as u8],
+      &[1],
+      &[epee_key_len!("compress")],
+      "compress".as_bytes(),
+      &[epee::Type::Bool as u8],
+      &[0], // TODO: Use compression
+      &[epee_key_len!("amounts")],
+      "amounts".as_bytes(),
+      // `amounts` is a vector of `u64` in the daemon protocol. Cuprate's Epee decoder enforces
+      // that width, so do not encode the RingCT zero as a one-byte integer.
+      &[(epee::Type::Uint64 as u8) | (epee::Array::Array as u8)],
+      &[1 << 2],
+      &0u64.to_le_bytes(),
+    ]
+    .concat();
+
+    let response = self
+      .bin_call(
+        "get_output_distribution.bin",
+        request,
+        request_to.saturating_sub(from).saturating_add(2).saturating_mul(8),
+      )
+      .await?;
+
+    let start_height = epee::extract_start_height(&response)?;
+    if start_height < from {
+      return Err(InterfaceError::InvalidInterface(format!(
+        "requested distribution from {from} and got from {start_height}"
+      )));
+    }
+    if start_height > request_to {
+      return Ok(Vec::new());
+    }
+
+    let expected_len = if zero_zero_case {
+      2
+    } else {
+      (request_to - start_height).checked_add(1).ok_or_else(|| {
+        InterfaceError::InternalError("distribution length exceeded usize".to_owned())
+      })?
+    };
+    let mut distribution = epee::extract_distribution(&response, expected_len)?;
+    if zero_zero_case {
+      distribution.pop();
+    }
+    Ok(distribution)
+  }
+
   /// Perform a binary call to the specified route with the provided parameters.
   ///
   /// The `response_size_limit` is expected to be in terms of the amount of bytes of data
@@ -206,93 +290,27 @@ impl<T: HttpTransport> ProvidesUnvalidatedDecoys for MoneroDaemon<T> {
         )))?;
       }
 
-      let zero_zero_case = (from == 0) && (to == 0);
-
-      #[expect(clippy::as_conversions)]
-      let request = [
-        epee::HEADER.as_slice(),
-        &[epee::VERSION],
-        &[5 << 2],
-        &[epee_key_len!("from_height")],
-        "from_height".as_bytes(),
-        &[epee::Type::Uint64 as u8],
-        &u64::try_from(from)
-          .map_err(|_| {
-            InterfaceError::InternalError("range's from wasn't representable as a `u64`".to_owned())
-          })?
-          .to_le_bytes(),
-        &[epee_key_len!("to_height")],
-        "to_height".as_bytes(),
-        &[epee::Type::Uint64 as u8],
-        &(if zero_zero_case {
-          1u64
-        } else {
-          u64::try_from(to).map_err(|_| {
-            InterfaceError::InternalError("range's to wasn't representable as a `u64`".to_owned())
-          })?
-        })
-        .to_le_bytes(),
-        &[epee_key_len!("cumulative")],
-        "cumulative".as_bytes(),
-        &[epee::Type::Bool as u8],
-        &[1],
-        &[epee_key_len!("compress")],
-        "compress".as_bytes(),
-        &[epee::Type::Bool as u8],
-        &[0], // TODO: Use compression
-        &[epee_key_len!("amounts")],
-        "amounts".as_bytes(),
-        // `amounts` is a vector of `u64` in the daemon protocol. Cuprate's Epee decoder enforces
-        // that width, so do not encode the RingCT zero as a one-byte integer.
-        &[(epee::Type::Uint64 as u8) | (epee::Array::Array as u8)],
-        &[1 << 2],
-        &0u64.to_le_bytes(),
-      ]
-      .concat();
-
-      let distributions = self
-        .bin_call(
-          "get_output_distribution.bin",
-          request,
-          to.saturating_sub(from).saturating_add(2).saturating_mul(8),
-        )
-        .await?;
-
-      let start_height = epee::extract_start_height(&distributions)?;
-
-      // start_height is also actually a block number, and it should be at least `from`
-      // It may be after depending on when these outputs first appeared on the blockchain
-      // Unfortunately, we can't validate without a binary search to find the RingCT activation
-      // block and an iterative search from there, so we solely sanity check it
-      if start_height < from {
-        Err(InterfaceError::InvalidInterface(format!(
-          "requested distribution from {from} and got from {start_height}"
-        )))?;
-      }
-      // It shouldn't be after `to` though
-      if start_height > to {
-        Err(InterfaceError::InvalidInterface(format!(
-          "requested distribution to {to} and got from {start_height}"
-        )))?;
+      // I2P HTTP tunnels can close long-lived responses before a megabyte. Keep each
+      // cumulative distribution response near 400 KB, then join ranges in height order.
+      // Since the daemon returns cumulative counts, concatenation preserves the original values.
+      const MAX_BLOCKS_PER_DISTRIBUTION_REQUEST: usize = 50_000;
+      let range_len = to.saturating_sub(from).saturating_add(1);
+      if range_len <= MAX_BLOCKS_PER_DISTRIBUTION_REQUEST {
+        return self.ringct_output_distribution_range(from, to).await;
       }
 
-      let expected_len = if zero_zero_case {
-        2
-      } else {
-        (to - start_height).checked_add(1).ok_or_else(|| {
-          InterfaceError::InternalError("expected length of distribution exceeded usize".to_owned())
-        })?
-      };
-
-      let mut distribution = epee::extract_distribution(&distributions, expected_len)?;
-
-      // Requesting to = 0 returns the distribution for the entire chain
-      // We work around this by requesting 0, 1 (yielding two blocks), then popping the second
-      // block
-      if zero_zero_case {
-        distribution.pop();
+      let mut distribution = Vec::new();
+      let mut chunk_from = from;
+      loop {
+        let chunk_to = chunk_from.saturating_add(MAX_BLOCKS_PER_DISTRIBUTION_REQUEST - 1).min(to);
+        distribution.extend(self.ringct_output_distribution_range(chunk_from, chunk_to).await?);
+        if chunk_to == to {
+          break;
+        }
+        chunk_from = chunk_to.checked_add(1).ok_or_else(|| {
+          InterfaceError::InternalError("distribution range exceeded usize".to_owned())
+        })?;
       }
-
       Ok(distribution)
     }
   }
